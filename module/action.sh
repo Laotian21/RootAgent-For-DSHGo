@@ -65,12 +65,16 @@ fi
 ra_mirror_token 2>/dev/null
 rm -f "$SB/token.txt" 2>/dev/null
 
-# 顺手把 proot 侧要装的三个文件放到共享存储，用户在 dsh-go 终端跑一趟 install.sh 即可
+# 顺手把 proot 侧要装的文件放到共享存储，用户在 dsh-go 终端跑一趟 install.sh 即可
 mkdir -p "$SB/proot" 2>/dev/null
-for f in dshsb-client dsh-bwrap-root rootrun install-proot.sh; do
+for f in dshsb-client dsh-bwrap-root rootrun; do
   [ -f "$MODDIR/bin/$f" ] || continue
   cp -f "$MODDIR/bin/$f" "$SB/proot/$f" 2>/dev/null && chmod 755 "$SB/proot/$f" 2>/dev/null
 done
+# 安装脚本在共享存储里叫 install.sh（和下面打印的命令一致）
+if [ -f "$MODDIR/bin/install-proot.sh" ]; then
+  cp -f "$MODDIR/bin/install-proot.sh" "$SB/proot/install.sh" 2>/dev/null && chmod 755 "$SB/proot/install.sh" 2>/dev/null
+fi
 
 TOK=$(cat "$TOKEN" 2>/dev/null)
 NOW=$(date '+%Y-%m-%d %H:%M:%S')
