@@ -1,0 +1,202 @@
+#!/usr/bin/env node
+/*
+ * dsh-bwrap-root — DSH sandbox seam 的「bwrap 方言」runner（跑在 proot 里）。
+ *
+ * 两种通道：
+ *  1) fd 通道（首选）：把本进程的 fd 1/2/7 经 unix socket + SCM_RIGHTS 交给 root 侧守护进程，
+ *     由它 fork 出带这些 fd 的子进程执行 dshsb-exec（fd 7 是 DSH 的 control 管道）。
+ *  2) HTTP 回退：没有 fd 3 时（如手工测试），退回 /spawn 流式接口，只转 stdout/stderr。
+ */
+'use strict'
+
+const fs = require('node:fs')
+const { spawn } = require('node:child_process')
+
+const ROOTFS = process.env.DSH_GO_RUNTIME_ROOT || detectRootfs()
+const PORT = Number(process.env.DSH_ROOT_AGENT_PORT || 47831)
+const TOKEN_FILE = process.env.ROOT_AGENT_TOKEN || '/root/.dsh/rootagent-token'
+const EXEC_BIN = process.env.DSH_SB_EXEC || '/data/adb/modules/rootagent/bin/dshsb-exec'
+const CLIENT_BIN = process.env.DSH_SB_CLIENT || '/usr/local/bin/dshsb-client'
+const SOCK_PATH = process.env.DSH_SB_SOCK || '/root/.dsh/rootagent-sandbox.sock'
+const TAG = 'dsh-bwrap-root: '
+
+const EXTRA_RO_BINDS = [
+  ['/system', '/system'],
+  ['/storage/emulated/0', '/sdcard'],
+]
+
+// 找 dsh-go 的 rootfs：DSH_GO_PKG 指定包名，否则扫描各 App 的 runtime 目录
+function detectRootfs() {
+  const pkg = process.env.DSH_GO_PKG || ''
+  if (pkg) return '/data/user/0/' + pkg + '/files/runtime/rootfs'
+  for (const base of ['/data/user/0', '/data/data']) {
+    let names = []
+    try { names = fs.readdirSync(base) } catch { continue }
+    for (const n of names) {
+      const p = base + '/' + n + '/files/runtime/rootfs'
+      try { if (fs.statSync(p + '/root').isDirectory()) return p } catch {}
+    }
+  }
+  return ''
+}
+
+function fail(msg) {
+  process.stderr.write(TAG + msg + '\n')
+  process.exit(111)
+}
+
+if (!ROOTFS) fail('找不到 dsh-go 的 runtime/rootfs：设 DSH_GO_PKG=<包名> 或 DSH_GO_RUNTIME_ROOT=<路径>')
+
+function hostPath(p) {
+  if (p === '/') return ROOTFS
+  if (p === '/system' || p.startsWith('/system/')) return p
+  if (p === '/sdcard' || p.startsWith('/sdcard/')) return '/storage/emulated/0' + p.slice('/sdcard'.length)
+  if (p === '/storage' || p.startsWith('/storage/')) return p
+  return ROOTFS + p
+}
+
+function shellQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'"
+}
+
+// ---- 解析 bwrap 方言 ----
+const argv = process.argv.slice(2)
+const profile = []
+let cmd = null
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--') { cmd = argv.slice(i + 1); break }
+  profile.push(argv[i])
+}
+if (!cmd || cmd.length === 0) fail('缺少 -- 之后的命令')
+
+function realId(kind) {
+  try {
+    const line = String(fs.readFileSync('/proc/self/status', 'utf8')).split('\n').find((l) => l.startsWith(kind + ':'))
+    if (line) return Number(line.split(/\s+/)[1]) || 0
+  } catch {}
+  return typeof process.getuid === 'function' ? process.getuid() : 0
+}
+const MY_UID = realId('Uid')
+const MY_GID = realId('Gid')
+const MASK_PATHS = ['/root/.dsh', '/sdcard/Download/RootAgent']
+const execArgs = ['--root', ROOTFS, '--proc', '/proc', '--dev', '/dev', '--uid', String(MY_UID), '--gid', String(MY_GID)]
+const roBinds = []
+const rwBinds = []
+let chdirTo = process.cwd()
+
+for (let i = 0; i < profile.length; i++) {
+  const a = profile[i]
+  if (a === '--ro-bind') {
+    const src = profile[++i], dst = profile[++i]
+    if (src === undefined || dst === undefined) fail('--ro-bind 参数不全')
+    if (src === '/' && dst === '/') continue
+    roBinds.push([hostPath(src), dst])
+  } else if (a === '--bind') {
+    const src = profile[++i], dst = profile[++i]
+    if (src === undefined || dst === undefined) fail('--bind 参数不全')
+    rwBinds.push([hostPath(src), dst])
+  } else if (a === '--tmpfs') {
+    const dst = profile[++i]
+    if (!dst) fail('--tmpfs 缺少参数')
+    execArgs.push('--tmpfs', dst)
+  } else if (a === '--dev' || a === '--proc') {
+    i++
+  } else if (a === '--chdir') {
+    chdirTo = profile[++i] || chdirTo
+  } else if (a === '--hostname' || a === '--dir') {
+    i++
+  } else if (a === '--setenv') {
+    i += 2
+  } else if (a.startsWith('--')) {
+    // --unshare-pid / --die-with-parent / --new-session 等：忽略（我们的实现不需要）
+  }
+}
+
+for (const [src, dst] of roBinds) execArgs.push('--ro-src', src, dst)
+for (const [src, dst] of rwBinds) execArgs.push('--rw-src', src, dst)
+for (const [src, dst] of EXTRA_RO_BINDS) {
+  if (roBinds.some(([, d]) => d === dst) || rwBinds.some(([, d]) => d === dst)) continue
+  execArgs.push('--ro-src', src, dst)
+}
+for (const m of MASK_PATHS) execArgs.push('--mask', m)
+execArgs.push('--chdir', chdirTo, '--', ...cmd)
+
+const envParts = []
+for (const [k, v] of Object.entries(process.env)) {
+  if (v === undefined) continue
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) continue
+  envParts.push(k + '=' + shellQuote(v))
+}
+const commandLine = '/system/bin/env -i ' + envParts.join(' ') + ' ' +
+  [EXEC_BIN, ...execArgs].map(shellQuote).join(' ')
+
+const header = JSON.stringify({ cmd: commandLine, cwd: '/' })
+
+function readToken() {
+  try {
+    return String(fs.readFileSync(TOKEN_FILE, 'utf8')).trim()
+  } catch {
+    return ''
+  }
+}
+
+function fdExists(n) {
+  try { fs.fstatSync(n); return true } catch { return false }
+}
+
+function runViaFds() {
+  return new Promise((resolve) => {
+    const child = spawn(CLIENT_BIN, [SOCK_PATH], {
+      stdio: ['ignore', 'inherit', 'inherit', 'ignore', 'ignore', 'ignore', 'ignore', 7],
+      env: { ...process.env, DSH_SB_HEADER: header, DSH_SB_SOCK: SOCK_PATH },
+    })
+    child.on('error', (e) => fail('启动 dshsb-client 失败: ' + e.message))
+    const forward = (sig) => { try { child.kill(sig) } catch {} }
+    process.on('SIGINT', () => { forward('SIGINT'); setTimeout(() => process.exit(130), 200) })
+    process.on('SIGTERM', () => { forward('SIGTERM'); setTimeout(() => process.exit(143), 200) })
+    child.on('exit', (code, signal) => resolve(code === null ? 143 : code))
+  })
+}
+
+async function runViaHttp() {
+  const token = readToken()
+  if (!token) fail('读不到令牌文件 ' + TOKEN_FILE)
+  let res
+  try {
+    res = await fetch('http://127.0.0.1:' + PORT + '/spawn', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },
+      body: JSON.stringify({ cmd: commandLine, cwd: '/', timeoutMs: 0 }),
+    })
+  } catch (e) {
+    fail('连不上 Root Agent (127.0.0.1:' + PORT + '): ' + (e && e.name))
+  }
+  if (!res.ok || !res.body) fail('守护进程返回 ' + res.status)
+  const reader = res.body.getReader()
+  let buf = Buffer.alloc(0)
+  let exitCode = 0
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf = Buffer.concat([buf, Buffer.from(value)])
+    while (buf.length >= 5) {
+      const type = String.fromCharCode(buf[0])
+      const len = buf.readUInt32BE(1)
+      if (len > 8 * 1024 * 1024) fail('帧长度异常: ' + len)
+      if (buf.length < 5 + len) break
+      const payload = buf.subarray(5, 5 + len)
+      buf = buf.subarray(5 + len)
+      if (type === 'o') process.stdout.write(payload)
+      else if (type === 'e') process.stderr.write(payload)
+      else if (type === 'x') exitCode = payload.readInt32LE(0)
+    }
+  }
+  return exitCode
+}
+
+const forceHttp = process.env.DSH_SB_FORCE_HTTP === '1'
+if (!forceHttp && fdExists(3) && fs.existsSync(CLIENT_BIN)) {
+  runViaFds().then((code) => process.exit(code))
+} else {
+  runViaHttp().then((code) => process.exit(code)).catch((e) => fail('内部错误 ' + (e && e.message)))
+}

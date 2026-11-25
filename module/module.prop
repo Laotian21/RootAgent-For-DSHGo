@@ -1,0 +1,6 @@
+id=rootagent
+name=Root Agent
+version=v1.3.0
+versionCode=13000
+author=dafeiyu
+description=给 dsh-go 用的本地 root 命令代理与 workspace-write 沙箱后端：仅监听 127.0.0.1、令牌鉴权、每设备独立令牌、开机自启 + 看门狗保活。

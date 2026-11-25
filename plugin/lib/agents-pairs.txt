@@ -1,0 +1,2 @@
+- 这里没有可用的沙箱后端（bubblewrap / Landlock 都不可用），`workspace-write` 沙箱模式一定会被拒绝。|@@@|- 原生的 bubblewrap / Landlock 不可用，但已接入 Root Agent 的自定义沙箱后端：**`workspace-write` 可用**（沙箱内以 App uid 运行、根只读、工作区可写）。
+- 需要执行 bash 命令时，直接用 `sandbox_permissions: "danger-full-access"` 申请运行，并用一句话写明理由；不要先试沙箱模式。|@@@|- 执行 bash 时优先用默认的 `workspace-write`；只有确实要动工作区外的文件、或要用真 root（rootrun）时，才申请 `danger-full-access` 并写明理由。

@@ -1,0 +1,56 @@
+#!/usr/bin/env node
+// rootrun — 在 dsh-go（proot）里用 Android 真 root 执行命令，走 Root Agent 守护进程。
+// 装到 proot 的 /usr/local/bin/rootrun（chmod 755）即可直接调用。
+// 用法: rootrun '<命令>'       环境变量: ROOT_AGENT_PORT / ROOT_AGENT_TOKEN / ROOT_AGENT_TIMEOUT
+const fs = require('node:fs')
+const PORT = Number(process.env.ROOT_AGENT_PORT || 47831)
+const TOKEN_FILE = process.env.ROOT_AGENT_TOKEN || '/root/.dsh/rootagent-token'
+const TIMEOUT = Number(process.env.ROOT_AGENT_TIMEOUT || 60000)
+const cmd = process.argv.slice(2).join(' ').trim()
+
+if (!cmd) {
+  console.error('用法: rootrun <命令>   例: rootrun "id -u; getprop ro.product.model"')
+  process.exit(2)
+}
+
+let token = ''
+try {
+  token = String(fs.readFileSync(TOKEN_FILE, 'utf8')).trim()
+} catch {
+  console.error('读不到令牌文件: ' + TOKEN_FILE)
+  console.error('先在 SukiSU 模块页点 Root Agent 的「执行」，或手动把令牌写进这个文件。')
+  process.exit(2)
+}
+if (!token) {
+  console.error('令牌文件是空的: ' + TOKEN_FILE)
+  process.exit(2)
+}
+
+const main = async () => {
+  let res
+  try {
+    res = await fetch('http://127.0.0.1:' + PORT + '/exec', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },
+      body: JSON.stringify({ cmd, timeoutMs: TIMEOUT }),
+      signal: AbortSignal.timeout(TIMEOUT + 5000),
+    })
+  } catch (e) {
+    console.error('连不上 Root Agent（127.0.0.1:' + PORT + '）：模块装了吗？重启过手机吗？')
+    process.exit(3)
+  }
+  let body = null
+  try { body = await res.json() } catch {}
+  if (!body) {
+    console.error('返回不是 JSON（HTTP ' + res.status + '）')
+    process.exit(3)
+  }
+  if (res.status === 401) { console.error('令牌无效：删掉 /data/adb/rootagent/token 后重新点「执行」换新令牌'); process.exit(4) }
+  if (res.status === 429) { console.error('守护进程正忙（并发上限 8），稍后重试'); process.exit(5) }
+  if (body.stdout) process.stdout.write(body.stdout)
+  if (body.stderr) process.stderr.write(body.stderr)
+  if (body.timedOut) console.error('[超时，已 kill]')
+  process.exit(typeof body.code === 'number' ? body.code : 1)
+}
+
+main()

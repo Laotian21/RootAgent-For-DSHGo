@@ -1,0 +1,46 @@
+{
+  "name": "local-root-agent",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "description": "基于 dsh-go 的本地 root 命令代理：仅监听 127.0.0.1、令牌鉴权、开机自启与看门狗保活，并在引擎启动时自检/修复沙箱后端与托管说明。",
+  "author": "dsh-go",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
+  },
+  "dshGo": {
+    "v": 1,
+    "title": {
+      "zh": "Root 代理",
+      "en": "Root Agent"
+    },
+    "icon": "terminal",
+    "contributes": {
+      "composer.strip": [
+        {
+          "id": "status",
+          "icon": "terminal",
+          "text": "Root 代理",
+          "panel": "root"
+        }
+      ],
+      "panels": [
+        {
+          "id": "root",
+          "title": "Root 代理",
+          "icon": "terminal",
+          "placement": [
+            "features",
+            "chat.panel"
+          ]
+        }
+      ]
+    }
+  }
+}
